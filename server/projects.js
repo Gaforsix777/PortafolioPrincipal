@@ -1,0 +1,5 @@
+export const projects = [
+  { id: 1, title: 'Trivia Game', category: 'Web', description: 'Un juego de preguntas para aprender, competir y poner a prueba lo que sabes.', image: '/trivialogodef.png', technologies: ['JavaScript', 'Web'], url: 'https://gaforsix777.github.io/triviagame/', repository: 'https://github.com/Gaforsix777/triviagame' },
+  { id: 2, title: 'Fragmentos del Olvido', category: 'Videojuegos', description: 'Una experiencia 2D construida en Unity. Explora su mundo y descubre su historia.', image: '/fragementos.jpeg', technologies: ['Unity', 'C#', '2D'], url: 'https://gaforsix777.itch.io/fragmentos-del-olvido', repository: null },
+  { id: 3, title: 'Procesamiento de Imágenes', category: 'Visión artificial', description: 'Exploración de algoritmos de visión artificial y transformación de imágenes con Python.', image: '/opencv.jpg', technologies: ['Python', 'OpenCV'], url: 'https://github.com/Gaforsix777/Procesamientodeimagenes', repository: 'https://github.com/Gaforsix777/Procesamientodeimagenes' },
+];

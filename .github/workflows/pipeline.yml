@@ -1,0 +1,217 @@
+name: Portafolio CI-CD
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never interrupt a Terraform apply. Serialize all production deployments.
+concurrency:
+  group: portfolio-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    name: Pruebas unitarias, integración y E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Unitarias (4 casos)
+        run: npm run test:unit
+      - name: Integración con SQLite real (6 casos)
+        run: npm run test:integration
+      - name: Compilar React
+        run: npm run build
+      - name: Instalar navegador
+        run: npx playwright install --with-deps chromium
+      - name: E2E navegador, API y BD (4 casos)
+        run: npm run test:e2e
+      - name: Guardar reporte E2E
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
+  infrastructure-check:
+    name: Validar Terraform, Ansible y Compose
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.16.6'
+      - run: terraform -chdir=infra fmt -check
+      - run: terraform -chdir=infra init -backend=false -input=false -lockfile=readonly
+      - run: terraform -chdir=infra validate
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - run: ansible-galaxy collection install -r ansible/requirements.yml
+      - name: Revisar sintaxis Ansible
+        working-directory: ansible
+        run: ansible-playbook -i 'localhost,' playbook.yml --syntax-check
+      - run: docker compose config --quiet
+      - run: bash -n scripts/docker-firewall.sh scripts/docker-smoke.sh
+
+  publish:
+    name: Empaquetar y publicar en Docker Hub
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [tests, infrastructure-check]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      image: ${{ steps.image.outputs.name }}@${{ steps.publish.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Comprobar configuración de Docker Hub
+        id: image
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          test -n "$DOCKERHUB_USERNAME" || { echo 'Falta la variable DOCKERHUB_USERNAME'; exit 1; }
+          test -n "$DOCKERHUB_TOKEN" || { echo 'Falta el secreto DOCKERHUB_TOKEN'; exit 1; }
+          echo "name=${DOCKERHUB_USERNAME}/portafolio" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Construir imagen verificable
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: portfolio-ci:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Probar imagen y persistencia antes de publicar
+        run: bash scripts/docker-smoke.sh portfolio-ci:test
+      - name: Publicar versión y latest
+        id: publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
+            ${{ steps.image.outputs.name }}:latest
+          cache-from: type=gha
+          provenance: true
+          sbom: true
+
+  deploy:
+    name: Crear VM OCI y configurar con Ansible
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment:
+      name: production
+      url: ${{ steps.url.outputs.url }}
+    env:
+      TF_IN_AUTOMATION: 'true'
+      OCI_REGION: ${{ vars.OCI_REGION || 'sa-saopaulo-1' }}
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET || 'portfolio-terraform-state' }}
+      ADMIN_SSH_CIDR: ${{ vars.ADMIN_SSH_CIDR }}
+      SITE_ADDRESS: ${{ vars.SITE_ADDRESS || ':80' }}
+      CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+      ENABLE_DEMO_TUNNEL: ${{ vars.ENABLE_DEMO_TUNNEL || 'false' }}
+      PORTFOLIO_IMAGE: ${{ needs.publish.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.16.6'
+          terraform_wrapper: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - run: ansible-galaxy collection install -r ansible/requirements.yml
+      - name: Preparar secretos temporales e IP del runner
+        run: |
+          RUNNER_IP=$(curl --fail --silent --show-error --retry 3 https://api.ipify.org)
+          export RUNNER_IP
+          python scripts/prepare-ci.py
+      - name: Preparar estado remoto OCI con bloqueo y versionado
+        id: state
+        run: python scripts/bootstrap-state.py
+      - name: Inicializar Terraform
+        env:
+          STATE_NAMESPACE: ${{ steps.state.outputs.namespace }}
+          STATE_BUCKET: ${{ steps.state.outputs.bucket }}
+        run: >-
+          terraform -chdir=infra init -input=false -lockfile=readonly
+          -backend-config="namespace=$STATE_NAMESPACE"
+          -backend-config="bucket=$STATE_BUCKET"
+          -backend-config="key=portfolio/production.tfstate"
+          -backend-config="region=$OCI_REGION"
+      - name: Planificar infraestructura
+        run: terraform -chdir=infra plan -input=false -lock-timeout=5m -out=portfolio.tfplan
+      - name: Crear o actualizar recursos
+        run: terraform -chdir=infra apply -input=false -lock-timeout=5m portfolio.tfplan
+      - name: Preparar inventario y configuración privada
+        id: inventory
+        run: python scripts/deploy-vars.py
+      - name: Registrar clave de host por primera conexión
+        env:
+          VM_IP: ${{ steps.inventory.outputs.ip }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          for attempt in $(seq 1 60); do
+            if ssh-keyscan -T 5 -t ed25519 "$VM_IP" > "$RUNNER_TEMP/host-key" 2>/dev/null && test -s "$RUNNER_TEMP/host-key"; then
+              cat "$RUNNER_TEMP/host-key" >> ~/.ssh/known_hosts
+              exit 0
+            fi
+            sleep 10
+          done
+          echo 'La VM no respondió por SSH'; exit 1
+      - name: Configurar y desplegar
+        working-directory: ansible
+        run: ansible-playbook -i inventory.ini --private-key "$DEPLOY_SSH_KEY" -e @deploy-vars.json playbook.yml
+      - name: Mostrar URL y verificar acceso público
+        id: url
+        env:
+          VM_IP: ${{ steps.inventory.outputs.ip }}
+        run: |
+          if [ "$SITE_ADDRESS" = ':80' ]; then URL="http://$VM_IP"; else URL="https://$SITE_ADDRESS"; fi
+          curl --fail --silent --show-error --retry 5 --retry-delay 5 "$URL/api/health"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          printf '### Portafolio desplegado\n\n[Ver portafolio](%s)\n\nImagen: `%s`\n' "$URL" "$PORTFOLIO_IMAGE" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ENABLE_DEMO_TUNNEL" = true ] && [ -z "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+            ssh -i "$DEPLOY_SSH_KEY" "ubuntu@$VM_IP" 'sudo docker compose -f /opt/ramiro-portfolio/docker-compose.yml --project-directory /opt/ramiro-portfolio logs --no-color quick-tunnel' 2>&1 | grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' | sort -u >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+      - name: Eliminar archivos temporales sensibles del runner
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/portfolio-secrets"
+          rm -f ~/.oci/config ansible/deploy-vars.json ansible/inventory.ini infra/portfolio.tfplan

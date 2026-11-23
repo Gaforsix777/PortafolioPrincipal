@@ -1,0 +1,4 @@
+bucket    = "portfolio-terraform-state"
+namespace = "NAMESPACE-OCI"
+key       = "portfolio/production.tfstate"
+region    = "sa-saopaulo-1"

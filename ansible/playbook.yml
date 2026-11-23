@@ -1,0 +1,148 @@
+---
+- name: Configurar Ubuntu y desplegar el portafolio
+  hosts: portfolio
+  become: true
+  gather_facts: false
+  vars:
+    app_dir: /opt/ramiro-portfolio
+  pre_tasks:
+    - name: Esperar SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+    - name: Esperar cloud-init
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+    - name: Recopilar información
+      ansible.builtin.setup:
+    - name: Verificar Ubuntu 24.04 y los parámetros
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == 'Ubuntu'
+          - ansible_facts.distribution_version == '24.04'
+          - portfolio_image is match('^[a-z0-9._/-]+(:[a-zA-Z0-9._-]+|@sha256:[a-f0-9]{64})$')
+          - site_address == ':80' or site_address is match('^[a-zA-Z0-9][a-zA-Z0-9.-]+$')
+  tasks:
+    - name: Instalar Git, firewall y dependencias de Docker
+      ansible.builtin.apt:
+        name: [ca-certificates, curl, git, ufw, iptables]
+        update_cache: true
+        state: present
+    - name: Crear directorio de llaves APT
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+    - name: Descargar llave oficial de Docker
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+    - name: Registrar repositorio oficial de Docker
+      ansible.builtin.apt_repository:
+        repo: 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable'
+        filename: docker
+        state: present
+    - name: Instalar Docker Engine y Compose
+      ansible.builtin.apt:
+        name: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin]
+        update_cache: true
+        state: present
+    - name: Iniciar Docker
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+    - name: Permitir SSH y tráfico web en iptables antes del rechazo de OCI
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: '{{ item }}'
+        jump: ACCEPT
+        action: insert
+        rule_num: 1
+      loop: ['22', '80', '443']
+    - name: Permitir SSH y web en UFW
+      community.general.ufw:
+        rule: allow
+        port: '{{ item }}'
+        proto: tcp
+      loop: ['22', '80', '443']
+    - name: Denegar conexiones entrantes por defecto
+      community.general.ufw:
+        direction: incoming
+        policy: deny
+    - name: Activar firewall
+      community.general.ufw:
+        state: enabled
+    - name: Crear directorio de despliegue
+      ansible.builtin.file:
+        path: '{{ app_dir }}'
+        state: directory
+        mode: '0755'
+    - name: Copiar configuración de contenedores
+      ansible.builtin.copy:
+        src: '{{ playbook_dir }}/../{{ item }}'
+        dest: '{{ app_dir }}/{{ item }}'
+        mode: '0644'
+      loop: [docker-compose.yml, Caddyfile]
+    - name: Escribir configuración privada
+      ansible.builtin.template:
+        src: portfolio.env.j2
+        dest: '{{ app_dir }}/.env'
+        mode: '0600'
+      no_log: true
+    - name: Crear configuración para el firewall de Docker
+      ansible.builtin.copy:
+        src: '{{ playbook_dir }}/../scripts/docker-firewall.sh'
+        dest: /usr/local/sbin/portfolio-docker-firewall
+        mode: '0755'
+      notify: Aplicar firewall Docker
+    - name: Instalar servicio persistente del firewall de Docker
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/portfolio-docker-firewall.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Restrict published Docker ports to HTTP and HTTPS
+          After=docker.service ufw.service netfilter-persistent.service
+          Requires=docker.service
+          PartOf=docker.service
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/portfolio-docker-firewall
+          RemainAfterExit=yes
+          [Install]
+          WantedBy=docker.service
+      notify: Aplicar firewall Docker
+    - name: Habilitar firewall persistente
+      ansible.builtin.systemd:
+        name: portfolio-docker-firewall
+        enabled: true
+        state: started
+        daemon_reload: true
+    - name: Aplicar handlers antes de desplegar
+      ansible.builtin.meta: flush_handlers
+    - name: Descargar y arrancar la versión publicada
+      ansible.builtin.command:
+        argv: [docker, compose, --profile, '{{ tunnel_profile }}', up, -d, --pull, always, --no-build, --remove-orphans, --wait, --wait-timeout, '180']
+        chdir: '{{ app_dir }}'
+      register: compose_result
+      changed_when: "'Started' in compose_result.stderr or 'Created' in compose_result.stderr or 'Recreated' in compose_result.stderr"
+    - name: Verificar aplicación a través del proxy
+      ansible.builtin.uri:
+        url: "{{ 'http://127.0.0.1/api/health' if site_address == ':80' else 'https://' + site_address + '/api/health' }}"
+        status_code: 200
+        return_content: true
+      register: health
+      retries: 12
+      delay: 10
+      until: health.status == 200
+    - name: Comprobar conexión con SQLite
+      ansible.builtin.assert:
+        that: health.json.database == 'connected'
+  handlers:
+    - name: Aplicar firewall Docker
+      ansible.builtin.systemd:
+        name: portfolio-docker-firewall
+        state: restarted
+        daemon_reload: true
